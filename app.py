@@ -1,6 +1,5 @@
 import io
 import zipfile
-from pathlib import Path
 
 import numpy as np
 import streamlit as st
@@ -10,15 +9,31 @@ st.set_page_config(page_title="Reroll — Encaixador de Roupas", page_icon="🧵
 
 CANVAS_SIZE_PADRAO = (1408, 3040)
 
-
-def carregar_mascara(arquivo, tamanho):
-    m = Image.open(arquivo).convert("L").resize(tamanho)
-    return m.point(lambda p: 255 if p > 128 else 0)
+# Cores fixas da máscara única — se um dia surgir uma categoria nova (cabelo, acessório, meia...),
+# adiciona uma linha aqui com a cor combinada e o resto do app já lida com ela automaticamente.
+CORES_CATEGORIA = {
+    "upperbody": (0x33, 0xFF, 0x00),
+    "lowerbody": (0xFF, 0x19, 0x00),
+    "shoes": (0xFF, 0xC0, 0x00),
+}
+TOLERANCIA_COR = 40  # distância máxima (RGB) pra um pixel ainda contar como daquela cor
 
 
 def cor_do_canto(imagem_rgb, margem=5):
     arr = np.array(imagem_rgb.convert("RGB"))
     return tuple(int(v) for v in arr[margem, margem])
+
+
+def separar_mascara_por_cor(imagem_mascara, tamanho):
+    img = imagem_mascara.convert("RGB").resize(tamanho)
+    arr = np.array(img).astype(int)
+
+    mascaras = {}
+    for categoria, cor in CORES_CATEGORIA.items():
+        distancia = np.sqrt(((arr - np.array(cor)) ** 2).sum(axis=2))
+        binaria = (distancia <= TOLERANCIA_COR).astype(np.uint8) * 255
+        mascaras[categoria] = Image.fromarray(binaria, mode="L")
+    return mascaras
 
 
 def redimensionar_para_canvas(imagem, canvas_size, cor_fundo):
@@ -38,21 +53,27 @@ def encaixar_roupa(imagem_original, mascaras, cor_fundo, canvas_size):
     for categoria, mascara in mascaras.items():
         recorte = imagem_no_canvas.convert("RGBA")
         recorte.putalpha(mascara)
-        canvas = Image.new("RGBA", canvas_size, cor_fundo + (255,))
+        # canvas totalmente transparente — sem preenchimento de cor, só a peça na posição certa
+        canvas = Image.new("RGBA", canvas_size, (0, 0, 0, 0))
         canvas.alpha_composite(recorte, (0, 0))
         resultados[categoria] = canvas
     return resultados
 
 
-def montar_zip(resultados_por_arquivo):
+def nome_arquivo(categoria, genero, nome_peca, numero):
+    return f"o_{categoria}{genero}_{nome_peca}_{numero:02d}.png"
+
+
+def montar_zip(resultados_por_indice, nomes_peca, genero, numero_inicial):
     buffer_zip = io.BytesIO()
     with zipfile.ZipFile(buffer_zip, "w") as zf:
-        for nome, pecas in resultados_por_arquivo.items():
-            base = Path(nome).stem
+        for i, pecas in resultados_por_indice.items():
+            numero = numero_inicial + i
             for categoria, img in pecas.items():
+                nome = nome_arquivo(categoria, genero, nomes_peca[categoria], numero)
                 buf = io.BytesIO()
                 img.save(buf, format="PNG")
-                zf.writestr(f"{base}_{categoria}.png", buf.getvalue())
+                zf.writestr(nome, buf.getvalue())
     buffer_zip.seek(0)
     return buffer_zip
 
@@ -68,6 +89,10 @@ with st.sidebar:
     canvas_h = st.number_input("Altura do canvas (px)", value=CANVAS_SIZE_PADRAO[1], step=1, min_value=1)
     st.caption("Deixe como está, a não ser que o projeto use outro tamanho de canvas.")
     st.divider()
+    st.caption("Cores fixas da máscara única:")
+    for cat, cor in CORES_CATEGORIA.items():
+        st.color_picker(cat, value="#%02X%02X%02X" % cor, disabled=True, key=f"cor_{cat}")
+    st.divider()
     if st.button("🔄 Recomeçar do zero"):
         st.session_state.clear()
         st.rerun()
@@ -76,11 +101,11 @@ with st.sidebar:
 st.title("🧵 Reroll — Encaixador de Roupas")
 st.caption(
     "Recorta automaticamente peças de roupa geradas no ChatGPT (upper body, lower body, shoes) "
-    "usando o corpo base e as máscaras do projeto, prontas pra encaixar no personagem."
+    "usando o corpo base e uma máscara única colorida, prontas pra encaixar no personagem."
 )
 
 passo1, passo2, passo3, passo4 = st.tabs(
-    ["1️⃣ Corpo base", "2️⃣ Máscaras", "3️⃣ Roupas geradas", "4️⃣ Resultado"]
+    ["1️⃣ Corpo base", "2️⃣ Máscara", "3️⃣ Roupas + nomenclatura", "4️⃣ Resultado"]
 )
 
 # ---------- passo 1 ----------
@@ -102,56 +127,42 @@ with passo1:
             st.success("Corpo base carregado.")
             st.write(f"**Cor de fundo detectada:** RGB{cor_fundo}")
             st.write(f"**Tamanho da imagem:** {corpo_base_img.size[0]} x {corpo_base_img.size[1]} px")
-            st.info("Se essa cor de fundo não bater com o magenta do seu projeto, confira se o corpo base está com fundo liso e sem borda de compressão.")
     else:
         st.info("Nenhum arquivo enviado ainda.")
 
 # ---------- passo 2 ----------
 with passo2:
-    st.subheader("Envie as 3 máscaras")
+    st.subheader("Envie a máscara única")
     st.write(
-        "Cada máscara define exatamente onde aquela peça deve aparecer — "
-        "**branco** = área da peça, **preto** = resto (fica transparente no recorte final)."
+        "Uma imagem só, com cada peça marcada por cor: "
+        "🟢 verde `#33FF00` = upper body · 🔴 vermelho `#FF1900` = lower body · "
+        "🟠 laranja `#FFC000` = shoes · resto (preto) = fundo."
     )
 
     if "corpo_base_img" not in st.session_state:
-        st.warning("⬅️ Envie o corpo base no passo 1 antes de subir as máscaras.")
+        st.warning("⬅️ Envie o corpo base no passo 1 antes de subir a máscara.")
     else:
-        col_upper, col_lower, col_shoes = st.columns(3)
-        arquivos_mascara = {}
-        with col_upper:
-            st.markdown("**Upper body**")
-            arquivos_mascara["upper"] = st.file_uploader(
-                "Máscara upper", type=["png"], key="mask_upper", label_visibility="collapsed"
-            )
-        with col_lower:
-            st.markdown("**Lower body**")
-            arquivos_mascara["lower"] = st.file_uploader(
-                "Máscara lower", type=["png"], key="mask_lower", label_visibility="collapsed"
-            )
-        with col_shoes:
-            st.markdown("**Shoes**")
-            arquivos_mascara["shoes"] = st.file_uploader(
-                "Máscara shoes", type=["png"], key="mask_shoes", label_visibility="collapsed"
-            )
+        mascara_arquivo = st.file_uploader("Máscara única", type=["png"], key="mascara_unica")
 
-        if all(arquivos_mascara.values()):
+        if mascara_arquivo:
             tamanho = st.session_state.corpo_base_img.size
-            mascaras = {cat: carregar_mascara(arq, tamanho) for cat, arq in arquivos_mascara.items()}
+            imagem_mascara = Image.open(mascara_arquivo)
+            mascaras = separar_mascara_por_cor(imagem_mascara, tamanho)
             st.session_state.mascaras = mascaras
 
-            st.success("3 máscaras carregadas.")
-            col_upper, col_lower, col_shoes = st.columns(3)
-            for col, cat in zip([col_upper, col_lower, col_shoes], ["upper", "lower", "shoes"]):
+            st.success("Máscara separada nas 3 categorias.")
+            col_original, col_upper, col_lower, col_shoes = st.columns(4)
+            with col_original:
+                st.image(imagem_mascara, caption="Original", use_container_width=True)
+            for col, cat in zip([col_upper, col_lower, col_shoes], CORES_CATEGORIA.keys()):
                 with col:
-                    st.image(mascaras[cat], use_container_width=True)
+                    st.image(mascaras[cat], caption=cat, use_container_width=True)
         else:
-            faltando = [c for c, a in arquivos_mascara.items() if not a]
-            st.info(f"Faltam: {', '.join(faltando)}")
+            st.info("Nenhuma máscara enviada ainda.")
 
 # ---------- passo 3 ----------
 with passo3:
-    st.subheader("Envie as roupas geradas no ChatGPT")
+    st.subheader("Roupas geradas no ChatGPT")
     if "mascaras" not in st.session_state:
         st.warning("⬅️ Complete os passos 1 e 2 antes de subir as roupas.")
     else:
@@ -170,6 +181,48 @@ with passo3:
             for i, arq in enumerate(roupas_arquivos):
                 with cols[i % n_cols]:
                     st.image(arq, caption=arq.name, use_container_width=True)
+
+            st.divider()
+            st.subheader("Nomenclatura do lote")
+            st.caption(
+                "Vale pra todo o lote acima. Formato final: `o_{categoria}{genero}_{nome}_{numero}.png` — "
+                "a numeração segue a ordem das roupas enviadas (a 1ª roupa gera o `_01` nas 3 categorias, "
+                "a 2ª gera `_02`, e assim por diante)."
+            )
+
+            col_genero, col_numero = st.columns(2)
+            with col_genero:
+                genero = st.radio("Gênero da base", ["F", "M"], horizontal=True, key="genero")
+            with col_numero:
+                numero_inicial = st.number_input(
+                    "Número inicial (pra continuar a numeração de um lote anterior)",
+                    value=1, min_value=1, step=1, key="numero_inicial",
+                )
+
+            col_up, col_low, col_sh = st.columns(3)
+            with col_up:
+                nome_upper = st.text_input("Nome peça — upperbody", placeholder="ex: jacket", key="nome_upper")
+            with col_low:
+                nome_lower = st.text_input("Nome peça — lowerbody", placeholder="ex: skirt", key="nome_lower")
+            with col_sh:
+                nome_shoes = st.text_input("Nome peça — shoes", placeholder="ex: sneaker", key="nome_shoes")
+
+            st.session_state.nomes_peca = {
+                "upperbody": nome_upper or "peca",
+                "lowerbody": nome_lower or "peca",
+                "shoes": nome_shoes or "peca",
+            }
+
+            with st.expander("Prévia dos nomes de arquivo"):
+                for i in range(min(len(roupas_arquivos), 3)):
+                    numero = numero_inicial + i
+                    linha = ", ".join(
+                        nome_arquivo(cat, genero, st.session_state.nomes_peca[cat], numero)
+                        for cat in CORES_CATEGORIA
+                    )
+                    st.code(linha, language=None)
+                if len(roupas_arquivos) > 3:
+                    st.caption(f"... + {len(roupas_arquivos) - 3} roupa(s) a mais, seguindo o mesmo padrão.")
         else:
             st.info("Nenhuma roupa enviada ainda. Pode selecionar várias de uma vez.")
 
@@ -191,7 +244,7 @@ with passo4:
             barra = st.progress(0, text="Processando...")
             for i, arq in enumerate(arquivos):
                 imagem = Image.open(arq)
-                resultados_totais[arq.name] = encaixar_roupa(imagem, mascaras, cor_fundo, canvas_size)
+                resultados_totais[i] = encaixar_roupa(imagem, mascaras, cor_fundo, canvas_size)
                 barra.progress((i + 1) / len(arquivos), text=f"Processando {i + 1}/{len(arquivos)}: {arq.name}")
 
             st.session_state.processado = resultados_totais
@@ -199,17 +252,22 @@ with passo4:
             st.success(f"{len(arquivos)} roupa(s) processada(s)!")
 
         if st.session_state.processado:
-            st.divider()
-            st.write("### Prévia dos resultados")
-            for nome, pecas in st.session_state.processado.items():
-                st.write(f"**{nome}**")
-                col1, col2, col3 = st.columns(3)
-                for col, cat in zip([col1, col2, col3], ["upper", "lower", "shoes"]):
-                    with col:
-                        st.image(pecas[cat], caption=cat, use_container_width=True)
+            genero = st.session_state.get("genero", "F")
+            numero_inicial = st.session_state.get("numero_inicial", 1)
+            nomes_peca = st.session_state.get("nomes_peca", {c: "peca" for c in CORES_CATEGORIA})
 
             st.divider()
-            zip_bytes = montar_zip(st.session_state.processado)
+            st.write("### Prévia dos resultados")
+            for i, pecas in st.session_state.processado.items():
+                numero = numero_inicial + i
+                st.write(f"**Roupa {i + 1}** (número `{numero:02d}`)")
+                cols = st.columns(3)
+                for col, cat in zip(cols, CORES_CATEGORIA.keys()):
+                    with col:
+                        st.image(pecas[cat], caption=nome_arquivo(cat, genero, nomes_peca[cat], numero), use_container_width=True)
+
+            st.divider()
+            zip_bytes = montar_zip(st.session_state.processado, nomes_peca, genero, numero_inicial)
             st.download_button(
                 "⬇️ Baixar todas as roupas (.zip)",
                 data=zip_bytes,
